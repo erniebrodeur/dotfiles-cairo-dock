@@ -1,0 +1,524 @@
+#!/usr/bin/python
+
+# This is a part of the external demo applet for Cairo-Dock
+#
+# Copyright : (C) 2010 by Fabounet & nbdarvin
+# E-mail : fabounet@users.berlios.de / nbdarvin@gmail.com
+# unread messages method taken from Sadrul <sadrul@pidgin.im>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+# http://www.gnu.org/licenses/licenses.html#GPL
+
+####################
+### dependancies ###
+####################
+import os.path
+import gobject
+import glib
+import subprocess
+import htmllib
+import re
+import dbus
+from CDApplet import CDApplet, _
+
+STATUS=['Not_connected', 'Offline', 'Online', 'Unavailable', 'Invisible', 'Away', 'Extended_away', 'Mobile', 'Tune']
+STATUS_ICO=['offline', 'offline', 'available', 'busy', 'invisible', 'away', 'extended-away', 'mobile', 'tune']
+
+def _unescape(s):
+	s = s.replace("&lt;", "<")
+	s = s.replace("&gt;", ">")
+	s = s.replace("&apos;", "'")
+	s = s.replace("&quot;", "'")
+	s = s.replace("&amp;", "&")  # a faire en dernier.
+	return s
+	
+####################
+### Applet class ###
+####################
+class Applet(CDApplet):
+	def __init__(self):
+		self.bus_name    = 'im.pidgin.purple.PurpleService'
+		self.object_path = '/im/pidgin/purple/PurpleObject'
+		self.iface_name  = 'im.pidgin.purple.PurpleInterface'
+		self.bus = None
+		self.purple = None
+		self.share_data_dir = ""  # we don't know it until the parent class has init, so we do it in the begin.
+		self.themes_dir = ""
+		self.iNbMsg = 0
+		self.pMsgList = []
+		self.iCurrentMsg = -1
+		self.iNbUnread = 0
+		self.bHasFocus = False
+		self.cStatus = ''
+		self.iCurrentConv = 0
+		self.iNbSiging = 0
+		self.iCurrentGuiConv = 0
+		self.bDemandsAttentionAvailable = True
+		self.bSilentMode = False
+		self.iAskingSomething = 0  # what kind of info we're asking the user.
+		CDApplet.__init__(self)
+	
+	### Private Methods ###
+	
+	def on_name_owner_changed(self,connection_name):
+		print "on_name_owner_changed:",connection_name
+		if len(connection_name) == 0:
+			self.purple = None
+			self.cStatus = STATUS[1]
+			self.set_status_icon()
+		else:
+			# get the object on the bus
+			bus_object = self.bus.get_object(connection_name, self.object_path)
+			self.purple = dbus.Interface(bus_object, self.iface_name)
+			# connect to signals
+			self.purple.connect_to_signal("SavedstatusChanged", self.on_status_changed)
+			self.purple.connect_to_signal("ReceivedImMsg", self.on_received_im_msg)
+			self.purple.connect_to_signal("ReceivedChatMsg", self.on_received_chat_msg)
+			self.purple.connect_to_signal("ConversationUpdated", self.on_conversation_updated)
+			self.purple.connect_to_signal("ConversationCreated", self.on_conversation_created)
+			self.purple.connect_to_signal("DeletingConversation", self.on_conversation_deleted)
+			self.purple.connect_to_signal("BuddyTyping", self.on_buddy_typing)
+			self.purple.connect_to_signal("BuddyTypingStopped", self.on_buddy_typing_stopped)
+			#self.purple.connect_to_signal("BuddyIconChanged", on_buddy_icon_changed)
+			#self.purple.connect_to_signal("BuddyStatusChanged", on_buddy_status_changed)
+			#self.purple.connect_to_signal("BuddyIdleChanged", on_buddy_idle_changed)
+			self.purple.connect_to_signal("BuddySignedOn", self.on_buddy_signed_on)
+			self.purple.connect_to_signal("BuddySignedOff", self.on_buddy_signed_off)
+			self.purple.connect_to_signal("Quitting", self.on_quit_pidgin)
+			self.purple.connect_to_signal("SigningOn", self.on_signing_on)
+			self.purple.connect_to_signal("SignedOn", self.on_signed_on)
+			self.purple.connect_to_signal("ConversationSwitched", self.on_conv_switched)
+			# get current status
+			status_type = self.purple.PurpleSavedstatusGetType(self.purple.PurpleSavedstatusGetCurrent())  # GetCurrent(int), GetType(int), GetTitle(string), GetMessage(string)
+			self.cStatus = STATUS[status_type]
+			# print ">>> current status : "+self.cStatus
+			self.set_status_icon()
+			self.update_nb_unread_msg()
+			#buddies_icons = self.list_buddies()
+			#self.sub_icons.AddSubIcons(buddies_icons)
+	
+	def get_nb_unread_msg(self,exception=0):
+		if self.purple is None:
+			return 0
+		n = 0
+		convs = self.purple.PurpleGetConversations()  # PurpleGetIms, PurpleGetChats
+		for conv in convs:
+			if conv != exception:
+				count = self.purple.PurpleConversationGetData(conv, "unseen-count")
+				if count and count > 0:
+					n += count
+		return n
+	
+	def set_nb_unread_msg(self,n):
+		if n == self.iNbUnread:
+			return
+		self.iNbUnread = n
+		if n > 0:
+			self.icon.SetQuickInfo(format(n,"d"))
+		else:
+			self.icon.SetQuickInfo('')
+	
+	def update_nb_unread_msg(self):
+		n = self.get_nb_unread_msg()
+		self.set_nb_unread_msg(n)
+	
+	def set_status_icon(self):
+		icon_path = self.themes_dir+self.config['cTheme']+"/"+self.cStatus+'.png'
+		emblem = None
+		if not os.path.isfile(icon_path):  # pas d'icone specifique pour ce statut.
+			icon_path = self.themes_dir+self.config['cTheme']+'/Online.png'  # on aplique l'embleme sur l'icone Online.
+			emblem = self.share_data_dir+'Emblems/'+self.cStatus+'.png'
+			if not os.path.isfile(emblem):  # pas d'embleme, on se rabat sur les emblemes de Pidgin.
+				emblem = '/usr/share/pixmaps/pidgin/status/48/'+self.cStatus.lower()+'.png'
+		# print ">>> new status icon : "+icon_path
+		self.icon.SetIcon(icon_path)
+		if emblem != None:
+			# print ">>> emblem : "+emblem
+			self.icon.SetEmblem(emblem, 1)  # lower right
+	
+	def set_status_message(self,message):
+		current = self.purple.PurpleSavedstatusGetType(self.purple.PurpleSavedstatusGetCurrent())  # on ne changera pas le statut courant.
+		status = self.purple.PurpleSavedstatusNew("", current)  # Create new transient status and activate it
+		self.purple.PurpleSavedstatusSetMessage(status, message)
+		self.purple.PurpleSavedstatusActivate(status)
+	
+	def list_convs(self):
+		tab_conv=[]
+		convs = self.purple.PurpleGetConversations()
+		for conv in convs:
+			conv_name = self.purple.PurpleConversationGetName(conv)
+			tab_conv.append(conv_name)
+		return tab_conv
+	
+	#def list_buddies(self):  # fait planter Pidgin :-(
+		#if self.purple is None:
+			#return
+		#tab_buddies = []
+		#accounts = self.purple.PurpleAccountsGetAllActive()
+		#for account in accounts:
+			## print ">>> account "+self.purple.PurpleAccountGetUsername(account)
+			#buddies = self.purple.PurpleFindBuddies(account,'')
+			#for buddy in buddies:
+				## print ">>>   + "+self.purple.PurpleBuddyGetName(buddy)
+				#icon = self.purple.PurpleBuddyGetIcon(buddy)
+				#try:
+					#icon_path = self.purple.PurpleBuddyIconGetFullPath(icon)
+				#except dbus.DBusException:
+					#icon_path='pidgin'
+				## print ">>>     "+icon_path
+				#tab_buddies.append(self.purple.PurpleBuddyGetName(buddy))
+				#tab_buddies.append(icon_path)
+				#tab_buddies.append(str(buddy))
+		#return tab_buddies
+	
+	##### Pidgin Events #####
+	
+	def on_status_changed(self, new_status, old_status):
+		# print ">>> status changed : ",old_status," -> ",new_status
+		self.cStatus = STATUS[self.purple.PurpleSavedstatusGetType(new_status)]
+		self.set_status_icon()
+	
+	def _on_received_msg(self, account, sender, message, conv, is_im):
+		if self.bSilentMode:
+			return
+		buddy = self.purple.PurpleFindBuddy(account,sender)
+		if buddy != 0:
+			sender = self.purple.PurpleBuddyGetAlias(buddy)
+		message = re.sub('<font.*?>','',message)
+		message = re.sub('<body.*?>','',message)
+		message = re.sub('<span.*?>','',message)
+		message = re.sub('<html.*?>','',message)
+		message = re.sub('<FONT.*?>','',message)
+		message = message.replace('</font>','')
+		message = message.replace('</body>','')
+		message = message.replace('</span>','')
+		message = message.replace('</html>','')
+		message = message.replace('</FONT>','')
+		message = message.replace('<B>','')
+		message = message.replace('</B>','')
+		message = message.replace('<b>','')
+		message = message.replace('</b>','')
+		message = message.replace('<i>','')
+		message = message.replace('</i>','')
+		message = message.replace('<I>','')
+		message = message.replace('</I>','')
+		message = '['+sender+'] '+_unescape(message)
+		# print ">>> message : "+message
+		bHasFocus = self.purple.PurpleConversationHasFocus(conv)
+		if not bHasFocus:  # si l'utilisateur n'est pas devant la conversation, on le notifie du message.
+			if (is_im and self.config['im message']) or (not is_im and self.config['chat message']):
+				msg = '['+sender+'] '+message
+				if self.iCurrentMsg != -1:
+					msg = self.pMsgList[self.iCurrentMsg]+"\n------------------------------------------\n"+msg
+				else:
+					msg = message
+				self.icon.ShowDialog(msg,max(2,len(msg)/self.config['duration']))
+			if self.config['msg animation'] != '':
+				try:
+					self.icon.DemandsAttention(True, self.config['msg animation'])
+				except dbus.DBusException:
+					self.bDemandsAttentionAvailable = False
+				if not self.bDemandsAttentionAvailable:
+					self.icon.Animate(self.config['msg animation'], 1e6)
+		
+		if self.config['history'] != 0:  # on insere le message dans l'historique.
+			self.pMsgList.insert(0,message)
+			self.iNbMsg += 1
+			if self.iNbMsg > self.config['history'] :
+				del self.pMsgList[self.config['history']]
+				self.iNbMsg -= 1
+			if self.iCurrentMsg != -1:
+				self.iCurrentMsg = min(self.iNbMsg-1, self.iCurrentMsg+1)  # on l'insere au debut donc ca decale le message courant.
+	
+	def on_received_im_msg(self, account, sender, message, conv, flag):
+		flag -= 1
+		# print ">>> im msg received : "+message,flag
+		if flag == 0 or flag == 2 or flag == 3 or flag == 8:  # Outgoing message, Auto response, System message, Error
+			return
+		self._on_received_msg(account, sender, message, conv, True)
+	
+	def on_received_chat_msg(self, account, sender, message, conv, flag):
+		flag -= 1
+		# print ">>> chat msg received : "+message,flag
+		if flag == 0 or flag == 2 or flag == 3 or flag == 8:  # Outgoing message, Auto response, System message, Error
+			return
+		self._on_received_msg(account, sender, message, conv, False)
+	
+	def on_conversation_updated(self, conv, update_type):
+		# print ">>> conv updated",conv,update_type
+		if update_type == 4:  # PURPLE_CONV_UPDATE_UNSEEN
+			iNbUnread = self.iNbUnread
+			self.update_nb_unread_msg()
+			if iNbUnread != 0 and self.iNbUnread == 0 and self.config['msg animation'] != '':
+				try:
+					self.icon.DemandsAttention(False,'')
+				except dbus.DBusException:
+					self.bDemandsAttentionAvailable = False
+				if not self.bDemandsAttentionAvailable:
+					self.icon.Animate('', 0)
+				self.iCurrentMsg = -1
+		if self.iCurrentGuiConv == 0:
+			self.iCurrentGuiConv = conv
+	
+	def on_conversation_created(self, conv):
+		# print ">>> conv created",conv
+		self.update_nb_unread_msg()
+	
+	def on_conversation_deleted(self, conv):
+		# print ">>> conv deleted",conv
+		self.update_nb_unread_msg()
+		if self.iCurrentConv == conv:
+			self.iCurrentConv = 0
+			self.icon.SetLabel(self.config['cOriginalName'])
+		if self.iCurrentGuiConv == conv:
+			self.iCurrentGuiConv = 0
+	
+	def on_buddy_typing(self, account,name):
+		# print ">>> buddy typing",name
+		self.icon.SetEmblem(self.share_data_dir+"Emblems/typing.png", 0)
+	
+	def on_buddy_typing_stopped(self, account,name):
+		# print ">>> buddy stopped typing : ",name
+		self.set_status_icon()
+	
+	#def on_buddy_icon_changed(self, name):
+		## print ">>> buddy icon changed : ",name
+		#icon = self.purple.PurpleBuddyGetIcon(name)
+		#self.sub_icons.SetIcon(self.purple.PurpleBuddyIconGetFullPath(icon))
+		
+	#def on_buddy_status_changed(self, name, old_status, new_status):
+		## print ">>> buddy status changed (",name,") : ",old_status," -> ",new_status
+		#status_type = self.purple.PurpleSavedstatusGetType(new_status)
+		#### ajouter un embleme ou une quick-info...
+		
+	#def on_buddy_idle_changed(self, name, old_idle, new_idle):
+		#print ">>> buddy idle changed (",name,") : ",old_idle," -> ",new_idle
+		#### ajouter un embleme...
+		
+	def on_buddy_signed_on(self, name):
+		print ">>> buddy signed on (",name,")"
+		### ajouter une sous-icone...
+		
+	def on_buddy_signed_off(self, name):
+		print ">>> buddy signed off (",name,")"
+		### retirer la sous-icone...
+		
+	def on_signing_on(self, conn):
+		# print ">>> signing on..."
+		self.iNbSiging += 1
+		self.icon.Animate('pulse',60)
+		
+	def on_signed_on(self, conn):
+		# print ">>> signed on"
+		self.iNbSiging -= 1
+		if self.iNbSiging == 0:
+			self.icon.Animate('',0)
+		
+	def on_conv_switched(self, conv):
+		# print ">>> conversation switched",conv
+		self.iCurrentGuiConv = conv
+	
+	def on_quit_pidgin(self):
+		# print ">>> Quit"
+		del self.purple
+		self.purple = None
+		self.cStatus = STATUS[1]
+		self.set_status_icon()
+	
+	##### applet definition #####
+	
+	def get_config(self,keyfile):
+		self.config['cTheme'] 			= keyfile.get('Configuration', 'theme')
+		self.config['cTheme'] 			= re.sub('\[[0-9]\]','',self.config['cTheme'])
+		self.config['im message'] 		= keyfile.getboolean('Configuration', 'im message')
+		self.config['chat message'] 	= keyfile.getboolean('Configuration', 'chat message')
+		self.config['msg animation'] 	= keyfile.get('Configuration', 'msg animation')
+		duration 						= keyfile.getint('Configuration', 'duration')
+		if duration == 0:
+			self.config['duration'] 	= 16
+		elif duration == 1:
+			self.config['duration'] 	= 8
+		else:
+			self.config['duration'] 	= 4
+		self.config['history'] 			= keyfile.getint('Configuration', 'history')
+		self.config['cOriginalName'] 	= keyfile.get('Icon', 'name')
+		
+	def begin(self):
+		self.share_data_dir = self.cShareDataDir+"/"
+		self.themes_dir = self.share_data_dir+'themes/'
+		self.bus = dbus.SessionBus()
+		self.bus.watch_name_owner(self.bus_name, self.on_name_owner_changed)
+		self.icon.ControlAppli("pidgin")
+	
+	def reload(self):
+		self.set_status_icon()
+	
+	##### callbacks #####
+	
+	def on_click(self, iState):
+		# print ">>> clic !"
+		Xid = self.icon.Get("Xid")
+		if Xid != 0:
+			if self.purple is None:
+				print "We couldn't connect to Pidgin. Check that Dbus is active in Pidgin."
+				return
+			if self.iCurrentGuiConv == 0:
+				convs = self.purple.PurpleGetConversations()
+				self.iCurrentGuiConv = convs[0]
+			if self.iCurrentGuiConv != 0:
+				print "present conv "+str(self.iCurrentGuiConv)
+				self.icon.ShowAppli(True) # we have to do that due to a bug in Pidgin (http://developer.pidgin.im/ticket/12534)
+				self.purple.PurpleConversationPresent(self.iCurrentGuiConv)  # on ne peut pas recuperer la conversation courante de l'IHM en regardant laquelle a le focus, car elles ne l'ont que lorsque la fenetre a le focus.
+		else:
+			subprocess.Popen("pidgin")
+		
+	def on_middle_click(self):
+		# print ">>> middle clic !"
+		if self.purple is None:
+			return
+		if self.iCurrentConv == 0:
+			self.icon.ShowDialog("No current conversation defined.\nPlease select a conversation with right-click.", 5)
+			return
+		conv_name = self.purple.PurpleConversationGetName(self.iCurrentConv)
+		dialog_attributes = {
+			"icon" : "gtk-italic",
+			"message" : "Send a message to "+conv_name,
+			"buttons" : "ok;cancel"}
+		widget_attributes = {
+			"widget-type" : "text-entry"}
+		self.icon.PopupDialog (dialog_attributes, widget_attributes)
+		self.iAskingSomething = 1
+	
+	def on_build_menu(self):
+		# print ">>> build menu !"
+		if self.purple is None:
+			return
+		
+		items=[{"type" : 1,  # 1 = sub-menu
+			"label": _("Conversations"),
+			"icon" : "gtk-jump-to",
+			"menu" : 0,
+			"id"   : 1,
+			"tooltip" : "Switch the conversation you'll send message to with the middle-click."}]
+		convs = self.list_convs()
+		i = 1
+		for conv in convs:
+			items.append({"type" : 0,
+				"label": conv,
+				"menu" : 1,
+				"id"   : 100+i})
+			i += 1
+		items.append({"type" : 1,
+			"label": _("Change your status"),
+			"icon" : "gtk-convert",
+			"menu" : 0,
+			"id"   : 2})
+		status = self.purple.PurpleSavedstatusGetType(self.purple.PurpleSavedstatusGetCurrent())
+		for i in range(1, 6):
+			if status != i:
+				items.append({"type" : 0,
+				"label": STATUS[i],
+				"icon" : '/usr/share/pixmaps/pidgin/status/16/'+STATUS_ICO[i]+'.png',
+				"menu" : 2,
+				"id"   : 200+i})
+		items.append({"type" : 2,  # 2 = separator
+			"menu" : 2})
+		items.append({"type" : 0,
+			"label": _("Set your status message"),
+			"icon" : "gtk-dialog-info",
+			"menu" : 2,
+			"id"   : 299})
+		items.append({"type" : 3,  # 3 = check-box
+			"label": _("Silent mode"),
+			"menu" : 0,
+			"id"   : 3,
+			"state": self.bSilentMode,
+			"tooltip" : _("Switch the applet to silent mode (no pop-up on new message).")})
+		
+		self.icon.AddMenuItems(items)
+		
+	def on_menu_select(self,iNumEntry):
+		# print ">>> choice",iNumEntry,"has been selected !"
+		if iNumEntry > 200:
+			iNumEntry -= 200
+			if iNumEntry == 99:
+				dialog_attributes = {
+					"icon" : "gtk-info",
+					"message" : _("Enter your new status message:"),
+					"buttons" : "ok;cancel"}
+				widget_attributes = {
+					"widget-type" : "text-entry"}
+				self.icon.PopupDialog (dialog_attributes, widget_attributes)
+				self.iAskingSomething = 2
+			else:
+				current_status = self.purple.PurpleSavedstatusGetType(self.purple.PurpleSavedstatusGetCurrent())
+				# print ">>> status :",STATUS[iNumEntry],iNumEntry
+				new_status = self.purple.PurpleSavedstatusNew("", iNumEntry)
+				self.purple.PurpleSavedstatusActivate(new_status)
+		elif iNumEntry > 100:
+			iNumEntry -= 101
+			convs = self.purple.PurpleGetConversations()
+			self.iCurrentConv = convs[iNumEntry]
+			conv_name = self.purple.PurpleConversationGetName(self.iCurrentConv)
+			# print ">>> selected conv ",conv_name
+			self.icon.SetLabel(conv_name)
+			self.purple.PurpleConversationPresent(self.iCurrentConv)
+		elif iNumEntry == 3:
+			self.bSilentMode = not self.bSilentMode
+		
+	def on_scroll(self,bScrollUp):
+		# print ">>> scroll !"
+		if self.iNbMsg != 0 :
+			if bScrollUp:
+				self.iCurrentMsg += 1
+			else:
+				self.iCurrentMsg -= 1
+			if self.iCurrentMsg >= self.iNbMsg:
+				self.iCurrentMsg = self.iNbMsg - 1
+			elif self.iCurrentMsg < -1:
+				self.iCurrentMsg = -1
+			if self.iCurrentMsg >= 0:
+				self.icon.ShowDialog(self.pMsgList[self.iCurrentMsg], 10)
+		
+	def on_answer_dialog(self,button,answer):
+		if button == 0 or button == -1:  # ok or Enter
+			if self.iAskingSomething == 1 :
+				if self.iCurrentConv == 0:
+					return
+				type = self.purple.PurpleConversationGetType(self.iCurrentConv)
+				if not type or type == 0:
+					return
+				if type == 1:  # PURPLE_CONV_TYPE_IM
+					im = self.purple.PurpleConvIm(self.iCurrentConv)
+					self.purple.PurpleConvImSend(im,answer)
+				else:  # PURPLE_CONV_TYPE_CHAT
+					chat = self.purple.PurpleConvChat(self.iCurrentConv)
+					self.purple.PurpleConvChatSend(chat,answer)
+			elif self.iAskingSomething == 2 :
+				self.iAskingSomething = 0
+				self.set_status_message (answer)
+	
+	#def on_click_sub_icon(iState, cIconID):
+		## print ">>> clic on the buddy "+self.purple.PurpleBuddyGetName(cIconID)
+		#buddy_name = self.purple.PurpleBuddyGetName(cIconID)
+		#account = self.purple.PurpleBuddyGetAccount(cIconID)
+		
+		#conv = self.purple.PurpleFindConversationWithAccount(1, buddy_name, account)  # 1 <=> PURPLE_CONV_TYPE_IM
+		#if conv == 0:
+			#self.purple.PurpleConversationNew(1, account, buddy_name)  # 1 <=> PURPLE_CONV_TYPE_IM
+		#else:
+			#self.purple.PurpleConversationPresent(conv)
+	
+############
+### main ###
+############
+if __name__ == '__main__':
+	Applet().run()

@@ -1,0 +1,8 @@
+
+[Launch]
+last version=2.4.0~2
+default backend=cairo
+last year=0
+
+[Gui]
+mode=0
